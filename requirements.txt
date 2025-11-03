@@ -1,0 +1,11 @@
+openai>=1.0.0
+transformers
+torch
+PyMuPDF
+Pillow
+pytesseract
+reportlab>=3.6.0
+numpy
+
+
+
