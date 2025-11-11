@@ -93,11 +93,19 @@ class Config:
     # 影响：背景透明度，太高遮挡原文，太低看不清文字
     
     # === 图像处理配置 ===
-    DPI = 180
+    DPI = 300
     # 说明：PDF转图片时的分辨率（DPI = Dots Per Inch）
     # 建议值：150-300，值越高图片越清晰但文件越大
     # 影响：150适合快速预览，300适合高质量输出
     # 重要：日语识别建议使用 200-300 DPI，太低会影响小字识别准确率
+    # 当前设置：300 DPI（高质量，适合精确OCR）
+    
+    PNG_COMPRESS_LEVEL = 0
+    # 说明：PNG压缩级别（0-9）
+    # 0 = 无压缩（最快，文件最大，质量最高）
+    # 9 = 最大压缩（最慢，文件最小，质量无损）
+    # 建议：0用于最高质量，6用于平衡质量和文件大小
+    # 注意：PNG是无损压缩，所以即使compress_level=9也不会损失质量
     
     OUTPUT_FOLDER = "ocr_boxes_output"
     # 说明：输出文件的保存文件夹路径
@@ -119,7 +127,7 @@ class Config:
     # True=显示置信度分数（如：テスト[0.95]），False=只显示文字
     
     # === OCR检测精度调整参数（重要！影响框的准确性）===
-    OCR_DET_DB_THRESH = 0.3
+    OCR_DET_DB_THRESH = 0.2
     # 说明：文本检测的二值化阈值（0.0-1.0）
     # 建议值：0.2-0.5，值越小检测越敏感，能检测到更模糊的文字
     # 影响：太小会误检噪点，太大会漏检文字
@@ -131,7 +139,7 @@ class Config:
     # 影响：太小会保留低质量框，太大会丢失文字
     # 如果发现标注框位置不准确，可以提高到0.6
     
-    OCR_DET_DB_UNCLIP_RATIO = 1.2
+    OCR_DET_DB_UNCLIP_RATIO = 1.5
     # 说明：文本框扩张比例（通常1.2-2.0）
     # [!] 这个参数很关键！直接影响标注框大小
     # 建议值：
@@ -159,13 +167,28 @@ class Config:
     # 建议值：-50 到 +50
     # 正值=向下移动，负值=向上移动
     # 如果框往上偏，增加此值；如果框往下偏，减少此值
+    
+    # === 调试模式 ===
+    DEBUG_SHOW_BOX_COORDS = False
+    # 说明：是否在标注框旁边显示坐标信息（用于调试偏移问题）
+    # True=显示坐标，False=不显示
+    # 开启后会在每个框旁边显示：序号、左上角坐标、宽高
+    # 用途：帮助你精确判断标注框位置是否正确
 
 config = Config()
 
 # ==================== OCR工具 ====================
 
 def pdf_to_images(pdf_path, output_folder="temp_pdf_images", dpi=150):
-    """将PDF转换为图片"""
+    """
+    将PDF转换为图片
+    
+    坐标系说明：
+    - PDF坐标系：原点在左下角，Y轴向上
+    - 图片坐标系：原点在左上角，Y轴向下
+    - PyMuPDF的get_pixmap()会自动处理坐标转换
+    - 缩放关系：图片像素坐标 = PDF坐标 × (dpi/72)
+    """
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
     
@@ -176,14 +199,15 @@ def pdf_to_images(pdf_path, output_folder="temp_pdf_images", dpi=150):
     
     for page_num in range(len(pdf_document)):
         page = pdf_document[page_num]
-        zoom = dpi / 72
+        zoom = dpi / 72  # PDF标准：72 DPI
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat)
         
         image_path = os.path.join(output_folder, f"page_{page_num + 1}.png")
+        # PyMuPDF保存PNG时已经是无损的，不需要额外参数
         pix.save(image_path)
         image_paths.append(image_path)
-        print(f"  => 已转换第 {page_num + 1} 页")
+        print(f"  => 已转换第 {page_num + 1} 页 (DPI={dpi}, 尺寸={pix.width}x{pix.height})")
     
     pdf_document.close()
     return image_paths
@@ -414,6 +438,37 @@ def draw_boxes_on_image(image_path, text_boxes, output_path):
         outline_color = color + (config.BOX_OPACITY,)
         draw.line(points + [points[0]], fill=outline_color, width=config.BOX_WIDTH)
         
+        # 调试模式：显示坐标信息
+        if config.DEBUG_SHOW_BOX_COORDS:
+            min_x = min(pt[0] for pt in points)
+            min_y = min(pt[1] for pt in points)
+            max_x = max(pt[0] for pt in points)
+            max_y = max(pt[1] for pt in points)
+            box_w = int(max_x - min_x)
+            box_h = int(max_y - min_y)
+            
+            # 创建调试信息文本
+            debug_text = f"#{idx+1} ({int(min_x)},{int(min_y)}) {box_w}x{box_h}"
+            
+            # 在框的右下角显示调试信息
+            debug_x = max_x + 5
+            debug_y = max_y - 15
+            
+            # 绘制半透明背景
+            try:
+                debug_bbox = draw.textbbox((debug_x, debug_y), debug_text, font=font)
+                debug_bg = (
+                    debug_bbox[0] - 2,
+                    debug_bbox[1] - 2,
+                    debug_bbox[2] + 2,
+                    debug_bbox[3] + 2
+                )
+                draw.rectangle(debug_bg, fill=(0, 0, 0, 200))
+                draw.text((debug_x, debug_y), debug_text, fill=(255, 255, 0, 255), font=font)
+            except:
+                # 降级方案
+                draw.text((debug_x, debug_y), debug_text, fill=(255, 255, 0, 255), font=font)
+        
         # 绘制文本标签
         if config.SHOW_TEXT_LABEL and text:
             # 计算文本框的边界
@@ -473,7 +528,8 @@ def draw_boxes_on_image(image_path, text_boxes, output_path):
     # 合并图层
     img = Image.alpha_composite(img, overlay)
     img = img.convert('RGB')
-    img.save(output_path, 'PNG')
+    # PNG无损保存：compress_level由配置决定（0=无压缩，9=最大压缩）
+    img.save(output_path, 'PNG', compress_level=config.PNG_COMPRESS_LEVEL)
     
     print(f"  => 已保存标注图片: {output_path}")
     return output_path
