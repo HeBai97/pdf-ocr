@@ -553,7 +553,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./output",
+        default="./ocr_boxes_output",
         help="输出目录（默认: ./output）"
     )
     

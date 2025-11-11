@@ -1,365 +1,344 @@
 """
-PDF OCR文本框可视化工具 V11 - 基于 DeepSeek-OCR (支持 Intel XPU)
-✅ 最终修复版：直接捕获模型输出
+PDF MinerU 解析标注工具 V2 - 基于 Intel Arc A40 显卡优化
+✅ 使用正确的 MinerU 模型路径和配置
 """
 
 import torch
-from transformers import AutoModel, AutoTokenizer
-from PIL import Image, ImageDraw
-import fitz  # PyMuPDF
 import os
-import shutil
 import argparse
 import time
-import re
+from PIL import Image, ImageDraw, ImageFont
+import fitz  # PyMuPDF
+import numpy as np
+import json
+import shutil
+import gc
 import sys
-from io import StringIO
-from reportlab.pdfgen import canvas
+from pathlib import Path
+import copy
+from typing import List
 
-# 尝试导入IPEX
-try:
-    import intel_extension_for_pytorch as ipex
-    ipex_available = True
-except (ImportError, OSError) as e:
-    ipex_available = False
-    print(f"IPEX不可用: {type(e).__name__}")
-
-# 设备检测
-if hasattr(torch, 'xpu') and torch.xpu.is_available():
-    device = 'xpu'
-    print(f"✅ 使用 Intel XPU: {torch.xpu.get_device_name(0)}")
-    if not ipex_available:
-        print("⚠️ 警告: IPEX未安装，性能可能受影响")
-else:
-    device = 'cpu'
-    print("⚠️ XPU不可用，使用CPU模式")
-
-# ==================== 配置 ====================
+# ==================== 环境配置 ====================
 class Config:
-    MODEL_NAME = 'deepseek-ai/DeepSeek-OCR'
-    DPI = 300
-    OUTPUT_FOLDER = "ocr_boxes_output"
-    BOX_WIDTH = 3
-    COLORS = [
-        (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 165, 0),
-        (255, 0, 255), (0, 255, 255), (255, 255, 0), (128, 0, 128),
-    ]
-    # OCR 配置
-    BASE_SIZE = 1024
-    IMAGE_SIZE = 1024
-    CROP_MODE = False
-
-config = Config()
-
-# ==================== 模型加载 ====================
-def load_model():
-    print(f"\n🚀 正在加载 DeepSeek-OCR 模型: {config.MODEL_NAME}")
+    def __init__(self, cache_dir=None):
+        self.device = self.setup_device()
+        self.modelscope_cache = self.setup_modelscope_cache(cache_dir)
+        self.mineru_model_path = self.setup_mineru_model_path()
     
-    tokenizer = AutoTokenizer.from_pretrained(config.MODEL_NAME, trust_remote_code=True)
-
-    if device == 'xpu':
-        model = AutoModel.from_pretrained(
-            config.MODEL_NAME, 
-            trust_remote_code=True, 
-            use_safetensors=True,
-            torch_dtype=torch.bfloat16
-        )
-        model = model.eval()
-        model = model.to('xpu')
-        if ipex_available:
-            model = ipex.optimize(model, dtype=torch.bfloat16)
-            print("✅ 已启用IPEX优化")
-    else:
-        model = AutoModel.from_pretrained(
-            config.MODEL_NAME, 
-            trust_remote_code=True, 
-            use_safetensors=True,
-            torch_dtype=torch.float32
-        )
-        model = model.eval()
-        model = model.to('cpu')
-        model = model.float()
-
-    print("✅ 模型加载完成！")
-    return model, tokenizer
-
-# ==================== PDF 转图像 ====================
-def pdf_to_images(pdf_path, dpi=300):
-    os.makedirs("temp_pdf_images", exist_ok=True)
-    doc = fitz.open(pdf_path)
-    image_paths = []
-    print(f"📄 PDF 共有 {len(doc)} 页")
-
-    for i in range(len(doc)):
-        page = doc[i]
-        mat = fitz.Matrix(dpi / 72, dpi / 72)
-        pix = page.get_pixmap(matrix=mat)
-        img_path = f"temp_pdf_images/page_{i+1}.png"
-        pix.save(img_path)
-        image_paths.append(img_path)
-        print(f"   ➜ 已转换第 {i+1} 页 ({pix.width}x{pix.height})")
-    doc.close()
-    return image_paths
-
-# ==================== OCR 识别（带坐标）====================
-def ocr_with_boxes(image_path, model, tokenizer):
-    try:
-        print(f"🔍 处理图片: {image_path}")
+    def setup_device(self):
+        """检测并配置 Intel Arc A40 显卡"""
+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
+            device = 'xpu'
+            print(f"✅ 检测到 Intel GPU: {torch.xpu.get_device_name(0)}")
+            print(f"   ➜ 可用设备数量: {torch.xpu.device_count()}")
+            torch.xpu.set_device(0)
+        else:
+            device = 'cpu'
+            print("⚠️ 未检测到 Intel XPU，使用 CPU 模式")
+        return device
+    
+    def setup_modelscope_cache(self, cache_dir=None):
+        """设置 ModelScope 缓存路径"""
+        if cache_dir:
+            cache_path = Path(cache_dir)
+        else:
+            cache_path = Path("D:/modelscope")
         
-        # 使用更简单的提示词
-        prompt = "<image>\n<|grounding|>OCR this document with bounding boxes."
+        cache_path.mkdir(parents=True, exist_ok=True)
+        os.environ['MODELSCOPE_CACHE'] = str(cache_path)
+        print(f"📁 ModelScope 缓存路径: {cache_path}")  
+        return cache_path
+    
+    def setup_mineru_model_path(self):
+        """设置 MinerU 模型路径 - 使用您提供的正确路径"""
+        # 使用您提供的实际模型路径
+        mineru_path = Path("D:/modelscope/hub/models/OpenDataLab/MinerU2___5-2509-1___2B")
+        pdf_kit_path = Path("D:/modelscope/hub/models/OpenDataLab/PDF-Extract-Kit-1___0")
         
-        start_time = time.time()
+        print(f"🔍 MinerU 模型路径: {mineru_path}")
+        print(f"🔍 PDF-Extract-Kit 路径: {pdf_kit_path}")
         
-        # 重定向标准输出以捕获模型输出
-        old_stdout = sys.stdout
-        sys.stdout = captured_output = StringIO()
+        # 检查路径是否存在
+        if not mineru_path.exists():
+            print(f"⚠️  MinerU 模型路径不存在: {mineru_path}")
+        if not pdf_kit_path.exists():
+            print(f"⚠️  PDF-Extract-Kit 路径不存在: {pdf_kit_path}")
+        
+        return {
+            "mineru": mineru_path,
+            "pdf_kit": pdf_kit_path
+        }
+
+# ==================== 直接使用 magic-pdf 的 MinerU 解析器 ====================
+class MinerUParser:
+    def __init__(self, config):
+        self.config = config
+        self.setup_environment()
+    
+    def setup_environment(self):
+        """设置 MinerU 环境"""
+        print("\n🚀 初始化 MinerU 解析器...")
+        
+        # 设置环境变量Q
+        os.environ['MODELSCOPE_CACHE'] = str(self.config.modelscope_cache)
         
         try:
-            # 调用 infer 方法 - 它会将结果打印到控制台
-            result = model.infer(
-                tokenizer, 
-                prompt=prompt, 
-                image_file=image_path, 
-                output_path="./temp_ocr_results", 
-                base_size=config.BASE_SIZE,
-                image_size=config.IMAGE_SIZE, 
-                crop_mode=config.CROP_MODE,
-                save_results=False,  # 不保存到文件，我们直接捕获输出
-                test_compress=True
-            )
-        finally:
-            # 恢复标准输出
-            sys.stdout = old_stdout
+            # 直接使用 magic-pdf 的解析功能
+            import magic_pdf
+            from magic_pdf.data.dataset import PymuDocDataset
+            from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
+            from magic_pdf.config.enums import SupportedPdfParseMethod
+            from magic_pdf.operators.models import InferenceResult
+            
+            self.PymuDocDataset = PymuDocDataset
+            self.doc_analyze = doc_analyze
+            self.SupportedPdfParseMethod = SupportedPdfParseMethod
+            self.InferenceResult = InferenceResult
+            
+            print("✅ magic-pdf 模块导入成功")
+            
+        except ImportError as e:
+            print(f"❌ magic-pdf 模块导入失败: {e}")
+            print("💡 请确保已安装: pip install magic-pdf")
+            raise
+    
+    def parse_pdf(self, pdf_path, lang="ch"):
+        """解析 PDF 文档"""
+        print(f"📄 开始解析 PDF: {pdf_path}")
         
-        # 获取捕获的输出
-        output_text = captured_output.getvalue()
-        elapsed_time = time.time() - start_time
+        try:
+            # 读取 PDF 文件
+            with open(pdf_path, 'rb') as f:
+                binary = f.read()
+            
+            # 创建数据集
+            ds = self.PymuDocDataset(binary)
+            
+            # 分类并应用解析
+            parse_method = ds.classify()
+            print(f"🔍 检测到解析方法: {parse_method}")
+            
+            if parse_method == self.SupportedPdfParseMethod.OCR or lang not in ['ch', 'en']:
+                print("🔍 使用 OCR 模式解析...")
+                infer_result = ds.apply(self.doc_analyze, ocr=True, lang=lang)
+                pipe_result = infer_result.pipe_ocr_mode(None)
+            else:
+                print("🔍 使用文本模式解析...")
+                infer_result = ds.apply(self.doc_analyze, ocr=False, lang=lang)
+                pipe_result = infer_result.pipe_txt_mode(None)
+            
+            # 获取中间结果
+            middle_json = pipe_result.get_middle_json()
+            middle_res = json.loads(middle_json)['pdf_info']
+            
+            print(f"✅ PDF 解析完成，共 {len(middle_res)} 页")
+            return middle_res
+            
+        except Exception as e:
+            print(f"❌ PDF 解析失败: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+# ==================== PDF 转图像 ====================
+def pdf_to_images(pdf_path, dpi=200):
+    """将 PDF 转换为图像"""
+    temp_dir = "temp_pdf_images"
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    image_paths = []
+    
+    try:
+        doc = fitz.open(pdf_path)
+        print(f"📄 PDF 共有 {len(doc)} 页")
+
+        for i in range(len(doc)):
+            page = doc[i]
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            pix = page.get_pixmap(matrix=mat)
+            img_path = os.path.join(temp_dir, f"page_{i+1}.png")
+            pix.save(img_path)
+            image_paths.append(img_path)
+            print(f"   ➜ 已转换第 {i+1} 页 ({pix.width}x{pix.height})")
         
-        print(f"   ➜ OCR 处理耗时: {elapsed_time:.2f} 秒")
-        
-        # 从输出中提取OCR结果
-        ocr_result = extract_ocr_from_output(output_text)
-        
-        # 解析返回结果
-        boxes = parse_deepseek_ocr_result(ocr_result, image_path)
-        return boxes
+        doc.close()
         
     except Exception as e:
-        print(f"[X] OCR 推理失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return []
+        print(f"❌ PDF 转换失败: {e}")
+    
+    return image_paths
 
-def extract_ocr_from_output(output_text):
-    """
-    从控制台输出中提取OCR结果
-    """
+# ==================== 文本块处理函数 ====================
+def _is_latin_start(text: str) -> bool:
+    """检查文本是否以拉丁字母开头"""
     try:
-        # 查找包含OCR结果的段落
-        lines = output_text.split('\n')
-        ocr_lines = []
-        capture = False
-        
+        if len(text) == 0:
+            return False
+        return text[0].isalpha()
+    except Exception as e:
+        print(f"文本检查错误: {text}")
+        return False
+
+def _merge_all_lines_on_block(block: dict, tag: str = 'content') -> str:
+    """合并块中的所有行"""
+    try:
+        lines = block.get('lines', [])
+        res = ''
         for line in lines:
-            # 查找开始标记
-            if '<|ref|>' in line:
-                capture = True
-            if capture:
-                ocr_lines.append(line)
-            # 查找结束标记（压缩比信息）
-            if 'compression ratio:' in line:
-                break
-        
-        return '\n'.join(ocr_lines)
-        
+            spans = line.get('spans', [])
+            for span in spans:
+                cur_text = span.get(tag, '')
+                if _is_latin_start(cur_text):
+                    if len(res) > 0 and res[-1] == '-':
+                        res = res[:-1] + cur_text
+                    else:
+                        res += ' ' + cur_text
+                else:
+                    res += cur_text
+        return res.lstrip()
     except Exception as e:
-        print(f"   [X] 提取OCR输出失败: {e}")
-        return output_text
+        print(f"合并行错误: {e}")
+        return ""
 
-def parse_deepseek_ocr_result(ocr_result, image_path):
-    """
-    解析 DeepSeek-OCR 的特殊输出格式
-    格式: <|ref|>text<|/ref|><|det|>[[x1,y1,x2,y2]]<|/det|>
-    """
-    boxes = []
+def extract_text_blocks(middle_res):
+    """从 MinerU 解析结果中提取文本块"""
+    text_blocks = []
     
-    try:
-        # 打开图像获取尺寸
-        pil_image = Image.open(image_path)
-        w, h = pil_image.size
-        print(f"   ➜ 图像尺寸: {w}x{h}")
+    for page_idx, page in enumerate(middle_res):
+        page_num = page_idx + 1
+        chunks = page.get('para_blocks', [])
         
-        if not ocr_result:
-            print("   ⚠️ OCR 结果为空")
-            return boxes
+        for chunk_idx, chunk in enumerate(chunks):
+            chunk_type = chunk.get('type', 'unknown')
+            bbox = chunk.get('bbox', [0, 0, 0, 0])
             
-        print(f"   ➜ OCR 原始输出长度: {len(ocr_result)} 字符")
-        print(f"   ➜ OCR 输出预览: {ocr_result[:500]}...")
-        
-        # DeepSeek-OCR 的特殊格式解析
-        # 格式: <|ref|>文本内容<|/ref|><|det|>[[x1,y1,x2,y2]]<|/det|>
-        pattern = r'<\|ref\|>(.*?)<\|/ref\|><\|det\|>\[\[(\d+),(\d+),(\d+),(\d+)\]\]<\|/det\|>'
-        matches = re.findall(pattern, ocr_result)
-        
-        print(f"   ➜ 找到 {len(matches)} 个标准文本框")
-        
-        for match in matches:
-            if len(match) == 5:
-                text, x1, y1, x2, y2 = match
-                try:
-                    x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-                    
-                    # 坐标处理 - DeepSeek-OCR 返回的坐标可能是相对坐标
-                    # 需要根据实际图像尺寸进行缩放
-                    scale_x = w / config.BASE_SIZE
-                    scale_y = h / config.BASE_SIZE
-                    
-                    x1_scaled = int(x1 * scale_x)
-                    y1_scaled = int(y1 * scale_y)
-                    x2_scaled = int(x2 * scale_x)
-                    y2_scaled = int(y2 * scale_y)
-                    
-                    # 确保坐标在图像范围内
-                    x1_final = max(0, min(x1_scaled, w))
-                    y1_final = max(0, min(y1_scaled, h))
-                    x2_final = max(0, min(x2_scaled, w))
-                    y2_final = max(0, min(y2_scaled, h))
-                    
-                    # 创建边界框
-                    box = [
-                        [x1_final, y1_final],
-                        [x2_final, y1_final],
-                        [x2_final, y2_final],
-                        [x1_final, y2_final]
-                    ]
-                    
-                    boxes.append((text.strip(), box))
-                    print(f"      - 文本: '{text[:20]}...' 坐标: [{x1_final},{y1_final},{x2_final},{y2_final}]")
-                    
-                except ValueError as ve:
-                    print(f"      [X] 坐标转换错误: {ve}")
-                    continue
-        
-        # 如果没有找到标准格式，尝试其他可能的格式
-        if not boxes:
-            print("   ⚠️ 尝试备用格式解析...")
-            # 尝试其他可能的坐标格式
-            alt_patterns = [
-                r'\[(\d+),(\d+),(\d+),(\d+)\]\s*(.*?)(?=\[|$)',
-                r'\((\d+),(\d+),(\d+),(\d+)\)\s*(.*?)(?=\(|$)',
-            ]
-            
-            for alt_pattern in alt_patterns:
-                alt_matches = re.findall(alt_pattern, ocr_result)
-                if alt_matches:
-                    print(f"   找到 {len(alt_matches)} 个备用格式文本框")
-                    for alt_match in alt_matches:
-                        if len(alt_match) == 5:
-                            x1, y1, x2, y2, text = alt_match
-                            try:
-                                x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-                                box = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-                                boxes.append((text.strip(), box))
-                            except ValueError:
-                                continue
-                    break
-        
-        # 如果仍然没有找到坐标，显示原始结果用于调试
-        if not boxes:
-            print("   ⚠️ 未找到标准文本框格式")
-            # 保存完整原始结果到文件用于分析
-            debug_file = image_path.replace('.png', '_debug.txt')
-            with open(debug_file, 'w', encoding='utf-8') as f:
-                f.write(ocr_result)
-            print(f"   💾 完整原始结果已保存到: {debug_file}")
-            
-            # 创建基于文本位置的模拟框
-            lines = ocr_result.split('\n')
-            valid_lines = [line.strip() for line in lines if len(line.strip()) > 5]
-            if valid_lines:
-                print(f"   创建 {len(valid_lines[:20])} 个模拟文本框")
-                for i, line in enumerate(valid_lines[:20]):  # 限制数量避免过多
-                    box_height = 40
-                    y_start = i * box_height + 100
-                    box_width = min(len(line) * 12 + 100, w - 200)
-                    box = [
-                        [100, y_start],
-                        [100 + box_width, y_start],
-                        [100 + box_width, y_start + box_height],
-                        [100, y_start + box_height]
-                    ]
-                    boxes.append((line, box))
-        
-    except Exception as e:
-        print(f"   [X] 解析OCR结果失败: {e}")
-        import traceback
-        traceback.print_exc()
+            # 提取所有类型的文本块
+            if chunk_type in ['title', 'list', 'index', 'text', 'interline_equation']:
+                text = _merge_all_lines_on_block(chunk)
+                
+                if text.strip():  # 只保留非空文本
+                    text_blocks.append({
+                        'page_num': page_num,
+                        'block_index': chunk_idx,
+                        'type': chunk_type,
+                        'bbox': bbox,
+                        'text': text,
+                        'confidence': 0.95
+                    })
     
-    return boxes
+    print(f"📝 提取到 {len(text_blocks)} 个文本块")
+    return text_blocks
 
 # ==================== 绘制文本框 ====================
-def draw_boxes_on_image(image_path, text_boxes, output_path):
+def draw_boxes_on_image(image_path, text_blocks, output_path):
+    """在图像上绘制文本框"""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    img = Image.open(image_path).convert("RGBA")
-    overlay = Image.new("RGBA", img.size, (255, 255, 255, 0))
-    draw = ImageDraw.Draw(overlay)
+    
+    try:
+        with Image.open(image_path) as img:
+            img_width, img_height = img.size
+            img = img.convert("RGBA")
+            overlay = Image.new("RGBA", img.size, (255, 255, 255, 0))
+            draw = ImageDraw.Draw(overlay)
 
-    print(f"   ➜ 绘制 {len(text_boxes)} 个文本框...")
+            # 颜色配置 - 根据块类型使用不同颜色
+            TYPE_COLORS = {
+                'title': (255, 0, 0),      # 红色 - 标题
+                'text': (0, 255, 0),       # 绿色 - 正文
+                'list': (0, 0, 255),       # 蓝色 - 列表
+                'index': (255, 165, 0),    # 橙色 - 索引
+                'interline_equation': (128, 0, 128),  # 紫色 - 公式
+                'unknown': (128, 128, 128) # 灰色 - 未知
+            }
+            
+            BOX_WIDTH = 3
 
-    for idx, (text, box) in enumerate(text_boxes):
-        color = config.COLORS[idx % len(config.COLORS)]
-        coords = [tuple(pt) for pt in box]
-        
-        # 绘制边界框
-        draw.line(coords + [coords[0]], fill=color + (255,), width=config.BOX_WIDTH)
-        
-        # 在框内添加文本标签（背景）
-        if text:
-            try:
-                # 简化文本显示
-                display_text = text[:20] + "..." if len(text) > 20 else text
-                # 计算文本位置（框的左上角）
-                text_x = coords[0][0]
-                text_y = coords[0][1] - 25
+            print(f"   ➜ 绘制 {len(text_blocks)} 个文本框...")
+
+            for idx, block in enumerate(text_blocks):
+                block_type = block['type']
+                color = TYPE_COLORS.get(block_type, (128, 128, 128))
+                bbox = block['bbox']
+                text = block['text']
                 
-                # 绘制文本背景
-                bbox = draw.textbbox((text_x, text_y), display_text)
-                draw.rectangle(bbox, fill=(0, 0, 0, 200))
-                # 绘制文本
-                draw.text((text_x, text_y), display_text, fill=(255, 255, 255, 255))
-            except Exception as e:
-                print(f"      [X] 绘制文本失败: {e}")
+                # 确保 bbox 坐标有效
+                if len(bbox) != 4:
+                    continue
+                
+                # 转换 bbox 坐标 [x0, y0, x1, y1] -> 多边形坐标
+                x0, y0, x1, y1 = bbox
+                # 确保坐标在图像范围内
+                x0 = max(0, min(x0, img_width))
+                y0 = max(0, min(y0, img_height))
+                x1 = max(0, min(x1, img_width))
+                y1 = max(0, min(y1, img_height))
+                
+                coords = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                
+                # 绘制边界框
+                draw.line(coords + [coords[0]], fill=color + (255,), width=BOX_WIDTH)
+                
+                # 在框内添加文本标签
+                if text:
+                    try:
+                        display_text = f"{block_type}: {text[:20]}..." if len(text) > 20 else f"{block_type}: {text}"
+                        text_x = max(10, x0)
+                        text_y = max(10, y0 - 35)
+                        
+                        # 绘制文本背景
+                        try:
+                            font = ImageFont.load_default()
+                            text_bbox = draw.textbbox((text_x, text_y), display_text, font=font)
+                        except:
+                            text_bbox = (text_x, text_y, text_x + len(display_text) * 8, text_y + 20)
+                        
+                        # 扩展背景框
+                        text_bbox = (text_bbox[0]-5, text_bbox[1]-2, text_bbox[2]+5, text_bbox[3]+2)
+                        draw.rectangle(text_bbox, fill=(0, 0, 0, 200))
+                        
+                        # 绘制文本
+                        draw.text((text_x, text_y), display_text, fill=(255, 255, 255, 255))
+                        
+                    except Exception as e:
+                        print(f"      [X] 绘制文本失败: {e}")
 
-    combined = Image.alpha_composite(img, overlay).convert("RGB")
-    combined.save(output_path, "PNG")
-    print(f"   ➜ 已保存: {output_path}")
+            combined = Image.alpha_composite(img, overlay).convert("RGB")
+            combined.save(output_path, "PNG")
+            print(f"   ➜ 已保存标注图片: {output_path}")
+            
+    except Exception as e:
+        print(f"   [X] 绘制图像失败: {e}")
+    
     return output_path
 
-# ==================== 图像转 PDF ====================
-def images_to_pdf(image_paths, output_pdf):
-    if not image_paths:
-        return False
-    c = canvas.Canvas(output_pdf)
-    for path in image_paths:
-        with Image.open(path) as img:
-            w, h = img.size
-            c.setPageSize((w, h))
-            c.drawImage(path, 0, 0, width=w, height=h)
-            c.showPage()
-    c.save()
-    print(f"✅ 标注 PDF 已生成: {output_pdf}")
-    return True
-
-# ==================== 保存文本 ====================
-def save_text(all_texts, output_name):
-    txt_path = os.path.join(config.OUTPUT_FOLDER, f"{output_name}_ocr_text.md")
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(all_texts))
-    print(f"✅ 识别文本已保存: {txt_path}")
+# ==================== 安全清理临时文件 ====================
+def safe_cleanup_temp_files():
+    """安全清理临时文件"""
+    temp_dir = "temp_pdf_images"
+    
+    if os.path.exists(temp_dir):
+        print("🧹 清理临时文件...")
+        try:
+            gc.collect()
+            
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    shutil.rmtree(temp_dir)
+                    print("✅ 临时文件已清理")
+                    break
+                except PermissionError:
+                    if attempt < max_retries - 1:
+                        print(f"   ⚠️ 文件占用，等待重试... ({attempt + 1}/{max_retries})")
+                        time.sleep(1)
+                    else:
+                        print("   ⚠️ 无法清理部分临时文件")
+        except Exception as e:
+            print(f"   ⚠️ 清理临时文件时出错: {e}")
 
 # ==================== 主处理函数 ====================
-def process_pdf(pdf_path, model, tokenizer, output_name=None):
+def process_pdf_with_mineru(pdf_path, output_name=None, cache_dir=None, lang="ch"):
+    """使用 MinerU 处理 PDF 并生成标注图片"""
     if not os.path.exists(pdf_path):
         print(f"[X] 文件不存在: {pdf_path}")
         return
@@ -367,90 +346,146 @@ def process_pdf(pdf_path, model, tokenizer, output_name=None):
     if output_name is None:
         output_name = os.path.splitext(os.path.basename(pdf_path))[0]
 
-    os.makedirs(config.OUTPUT_FOLDER, exist_ok=True)
+    output_folder = "ocr_boxes_output"
+    os.makedirs(output_folder, exist_ok=True)
 
     print(f"\n{'='*60}")
     print(f"📄 开始处理 PDF: {pdf_path}")
-    print(f"🧠 使用模型: {config.MODEL_NAME}")
+    print(f"🧠 使用框架: MinerU (magic-pdf)")
     print(f"💻 设备: {device.upper()}")
+    print(f"🌐 语言: {lang}")
+    if cache_dir:
+        print(f"💾 缓存目录: {cache_dir}")
     print(f"{'='*60}")
 
-    # 1. PDF -> Images
-    print("\n[1/4] 🖼️  将 PDF 转换为图像...")
-    image_paths = pdf_to_images(pdf_path, dpi=config.DPI)
-    print(f"✅ 完成：共 {len(image_paths)} 页")
+    start_time = time.time()
 
-    # 2. OCR + 绘图
-    print("\n[2/4] 🔍 执行 OCR 并绘制文本框...")
-    annotated_images = []
-    all_texts = []
-
-    for i, img_path in enumerate(image_paths, 1):
-        print(f"\n--- 第 {i}/{len(image_paths)} 页 ---")
+    try:
+        # 1. 初始化配置和解析器
+        print("\n[1/4] 🚀 初始化 MinerU 解析器...")
+        config = Config(cache_dir)
+        parser = MinerUParser(config)
         
-        boxes = ocr_with_boxes(img_path, model, tokenizer)
-        print(f"   ➜ 识别到 {len(boxes)} 个文本块")
+        # 2. 使用 MinerU 解析 PDF
+        print("\n[2/4] 🔍 使用 MinerU 解析 PDF...")
+        middle_res = parser.parse_pdf(pdf_path, lang=lang)
+        
+        # 保存解析结果
+        middle_res_file = os.path.join(output_folder, f"{output_name}_mineru_result.json")
+        with open(middle_res_file, 'w', encoding='utf-8') as f:
+            json.dump(middle_res, f, ensure_ascii=False, indent=2)
+        print(f"✅ MinerU 解析结果已保存: {middle_res_file}")
+        
+        # 3. 提取文本块
+        print("\n[3/4] 📝 提取文本块信息...")
+        text_blocks = extract_text_blocks(middle_res)
+        
+        # 按页面分组文本块
+        page_blocks = {}
+        for block in text_blocks:
+            page_num = block['page_num']
+            if page_num not in page_blocks:
+                page_blocks[page_num] = []
+            page_blocks[page_num].append(block)
+        
+        # 4. PDF -> Images + 绘制标注
+        print("\n[4/4] 🖼️  生成标注图像...")
+        image_paths = pdf_to_images(pdf_path, dpi=200)
+        annotated_images = []
+        
+        for i, img_path in enumerate(image_paths, 1):
+            print(f"\n--- 第 {i}/{len(image_paths)} 页 ---")
+            
+            if i in page_blocks:
+                page_blocks_i = page_blocks[i]
+                print(f"   ➜ 本页有 {len(page_blocks_i)} 个文本块")
+                
+                # 绘图
+                out_img = os.path.join(output_folder, f"{output_name}_page_{i}_annotated.png")
+                draw_boxes_on_image(img_path, page_blocks_i, out_img)
+                annotated_images.append(out_img)
+            else:
+                print("   ➜ 本页没有检测到文本块")
+        
+        # 5. 保存处理摘要
+        elapsed_time = time.time() - start_time
+        
+        summary = {
+            "pdf_file": pdf_path,
+            "total_pages": len(image_paths),
+            "parsed_blocks": len(text_blocks),
+            "output_folder": output_folder,
+            "annotated_images": [os.path.basename(p) for p in annotated_images],
+            "processed_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "processing_time_seconds": round(elapsed_time, 2),
+            "device_used": device,
+            "model_used": "MinerU (magic-pdf)",
+            "language": lang,
+            "block_types": {
+                block_type: len([b for b in text_blocks if b['type'] == block_type])
+                for block_type in set(b['type'] for b in text_blocks)
+            }
+        }
+        
+        summary_file = os.path.join(output_folder, f"{output_name}_processing_summary.json")
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        
+        print(f"✅ 处理摘要已保存: {summary_file}")
+        
+        # 保存文本块详细信息
+        blocks_file = os.path.join(output_folder, f"{output_name}_text_blocks.json")
+        with open(blocks_file, 'w', encoding='utf-8') as f:
+            json.dump(text_blocks, f, ensure_ascii=False, indent=2)
+        
+        print(f"✅ 文本块详情已保存: {blocks_file}")
 
-        # 提取文本
-        texts = [text for text, _ in boxes]
-        page_text = "\n".join(texts)
-        print(f"   ➜ 文本长度: {len(page_text)} 字符")
-        all_texts.append(f"# 第 {i} 页\n\n{page_text}\n\n")
+    except Exception as e:
+        print(f"❌ 处理失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return
 
-        # 绘图
-        out_img = os.path.join(config.OUTPUT_FOLDER, f"{output_name}_page_{i}_annotated.png")
-        draw_boxes_on_image(img_path, boxes, out_img)
-        annotated_images.append(out_img)
+    # 安全清理临时文件
+    safe_cleanup_temp_files()
 
-    # 3. 生成 PDF
-    print("\n[3/4] 📄 生成标注 PDF...")
-    pdf_out = os.path.join(config.OUTPUT_FOLDER, f"{output_name}_annotated.pdf")
-    images_to_pdf(annotated_images, pdf_out)
-
-    # 4. 保存文本
-    print("\n[4/4] 💾 保存识别文本...")
-    save_text(all_texts, output_name)
-
-    # 清理临时文件
-    print("\n🧹 清理临时文件...")
-    if os.path.exists("temp_pdf_images"):
-        shutil.rmtree("temp_pdf_images")
-    if os.path.exists("temp_ocr_results"):
-        shutil.rmtree("temp_ocr_results")
-    print("✅ 临时文件已清理")
-
-    print(f"\n🎉 处理完成！输出目录: {config.OUTPUT_FOLDER}/")
-    print(f"   • 标注 PDF: {output_name}_annotated.pdf")
-    print(f"   • 识别文本: {output_name}_ocr_text.md")
-    print(f"   • 标注图片: {output_name}_page_*.png")
+    print(f"\n🎉 MinerU PDF 解析标注完成！")
+    print(f"⏱️  总耗时: {elapsed_time:.2f} 秒")
+    print(f"📁 输出目录: {output_folder}/")
+    print(f"🖼️  标注图片: {len(annotated_images)} 张")
+    print(f"📝 解析块数: {len(text_blocks)} 个")
     print(f"{'='*60}\n")
 
 # ==================== 主函数 ====================
 def main():
-    parser = argparse.ArgumentParser(description="PDF OCR 文本框可视化工具 (DeepSeek-OCR)")
+    parser = argparse.ArgumentParser(description="PDF MinerU 解析标注工具 V2")
     parser.add_argument("pdf_file", help="输入 PDF 文件路径")
     parser.add_argument("-o", "--output", help="输出文件名前缀")
-    parser.add_argument("--dpi", type=int, default=300, help="PDF 转图像 DPI")
-    parser.add_argument("--base_size", type=int, default=1024, help="OCR 基础尺寸")
+    parser.add_argument("--cache-dir", help="ModelScope 缓存目录")
+    parser.add_argument("--lang", default="ch", choices=['ch', 'en'], help="文档语言")
+    parser.add_argument("--dpi", type=int, default=200, help="PDF 转图像 DPI")
+    
     args = parser.parse_args()
 
-    config.DPI = args.dpi
-    config.BASE_SIZE = args.base_size
-    config.IMAGE_SIZE = args.base_size
-    
-    model, tokenizer = load_model()
-    process_pdf(args.pdf_file, model, tokenizer, args.output)
+    process_pdf_with_mineru(
+        args.pdf_file, 
+        args.output, 
+        args.cache_dir,
+        args.lang
+    )
 
 if __name__ == "__main__":
-    if len(os.sys.argv) == 1:
-        default_pdf = "japanese_test.pdf"
-        if os.path.exists(default_pdf):
-            print(f"🔍 使用默认文件: {default_pdf}")
-            model, tokenizer = load_model()
-            process_pdf(default_pdf, model, tokenizer)
-        else:
-            print("📌 用法: python pdf_ocr_with_boxes.py <pdf文件>")
-            print("示例:")
-            print("   python pdf_ocr_with_boxes.py input.pdf --dpi 300 --base_size 1024")
+    # 全局设备变量
+    device = "xpu" if hasattr(torch, 'xpu') and torch.xpu.is_available() else "cpu"
+    
+    if len(sys.argv) == 1:
+        print("📌 用法: python pdf_mineru_annotation_v2.py <pdf文件> [选项]")
+        print("\n示例:")
+        print("  # 基本使用")
+        print("  python pdf_mineru_annotation_v2.py document.pdf")
+        print("  # 指定输出名称和语言")
+        print("  python pdf_mineru_annotation_v2.py document.pdf -o result --lang en")
+        print("  # 指定缓存目录")
+        print("  python pdf_mineru_annotation_v2.py document.pdf --cache-dir D:/modelscope")
     else:
         main()
